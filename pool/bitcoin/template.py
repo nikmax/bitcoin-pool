@@ -1,0 +1,1 @@
+from shared.bitcoin import make_job_from_template

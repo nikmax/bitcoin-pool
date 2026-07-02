@@ -1,0 +1,21 @@
+{
+  "network": "mainnet",
+  "rpc_url": "http://127.0.0.1:8332",
+  "rpc_user": "bitcoinrpc",
+  "rpc_pass": "change-me",
+  "mining_address": "bc1qreplace-with-your-address",
+  "web_host": "0.0.0.0",
+  "web_port": 8080,
+  "worker_token": "change-this-long-random-token",
+  "gpu_batch_size": 262144,
+  "worker_offline_after_seconds": 20,
+  "worker_remove_after_seconds": 120,
+  "safety_note": "v0.3.7: Worker bremsen/stoppen lokal über max_gpu_temp_c; Master hat NOT-AUS /panic.",
+  "version": "master-2.0",
+  "note": "Master 2.0: full getblocktemplate path, no mine_empty_blocks switch, improved Bitcoin Core RPC error reporting.",
+  "worker_hashrate_stale_after_seconds": 8,
+  "dashboard_auth_enabled": true,
+  "dashboard_user": "admin",
+  "dashboard_password_hash": "e2186dbdb1bb4193608605e84f33208765b5693b55edd4f730a719a100eeea6f",
+  "worker_name_unique_enforced": true
+}

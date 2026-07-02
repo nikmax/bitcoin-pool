@@ -1,0 +1,12 @@
+services:
+  btc_pool:
+    image: python:3.11-slim
+    container_name: btc_pool
+    restart: unless-stopped
+    volumes:
+      - ./:/btc
+      - ./config.json:/btc/pool/config.json
+    ports:
+      - "8080:8080"
+    command:
+      - /btc/start.sh
