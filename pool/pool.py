@@ -61,6 +61,29 @@ STATE = {
     "verified_total_hashes": 0,
 }
 JOBS = {}
+JOB_CREATED_AT = {}
+
+def job_limits():
+    c = cfg()
+    return int(c.get("max_cached_jobs", 500)), int(c.get("max_cached_job_age_seconds", 900))
+
+def prune_jobs_locked():
+    """Keep the in-memory job cache bounded. Full templates can contain large
+    transaction hex strings, so retaining every assigned job will slowly fill RAM.
+    We keep recent jobs long enough for late found messages, then drop old ones.
+    """
+    now = time.time()
+    max_jobs, max_age = job_limits()
+    for jid, ts in list(JOB_CREATED_AT.items()):
+        if now - float(ts or 0) > max_age:
+            JOB_CREATED_AT.pop(jid, None)
+            JOBS.pop(jid, None)
+    overflow = max(0, len(JOBS) - max_jobs)
+    if overflow:
+        for jid in list(JOBS.keys())[:overflow]:
+            JOBS.pop(jid, None)
+            JOB_CREATED_AT.pop(jid, None)
+
 BENCHMARK = {
     "running": False,
     "benchmark_id": None,
@@ -401,6 +424,13 @@ def refresh_template(force=False):
             if force:
                 EXTRANONCE = 0
             start_round_locked(round_id, tmpl, template_id=template_id, force_new=force)
+            # On a new chain tip/manual start, old jobs are stale and can be dropped.
+            # This avoids retaining full-template transaction data indefinitely.
+            if force:
+                JOBS.clear()
+                JOB_CREATED_AT.clear()
+            else:
+                prune_jobs_locked()
     return ACTIVE_TEMPLATE
 
 def template_watcher():
@@ -429,6 +459,8 @@ def alloc_job(worker_id):
     job["round_id"] = STATE.get("round_id")
     with lock:
         JOBS[job_id] = job
+        JOB_CREATED_AT[job_id] = time.time()
+        prune_jobs_locked()
     public = {k: job[k] for k in ["job_id", "template_id", "round_id", "height", "transactions", "previousblockhash", "bits", "target_hex", "header_prefix_hex", "extranonce"]}
     public["max_nonce"] = 0xffffffff
     public["recommended_batch_size"] = int(cfg().get("gpu_batch_size", 262144))
@@ -495,6 +527,8 @@ def snapshot():
     s["runtime_seconds"] = int(now - s["started_at"]) if s.get("started_at") else 0
     s["verified_total_hashes"] = sum(int(w.get("total_hashes", 0) or 0) for w in s["workers"].values() if w.get("online"))
     s["verify_worker_count"] = len(s.get("workers", {}))
+    with lock:
+        s["cached_jobs"] = len(JOBS)
     with lock:
         s["current_round"] = round_summary_locked(CURRENT_ROUND)
         s["recent_blocks"] = copy.deepcopy(COMPLETED_BLOCKS[-20:])
@@ -602,7 +636,11 @@ def worker_job():
     with lock:
         running = STATE["running"]
         STATE["workers"].setdefault(wid, {"worker_id": wid})
-        update = {"last_seen": time.time(), "online": True, "status": "waiting_job"}
+        # Do not flip the visible status to a transient "waiting_job" on every
+        # poll. That made the dashboard flicker when workers received new jobs.
+        update = {"last_seen": time.time(), "online": True}
+        if not STATE["workers"][wid].get("status"):
+            update["status"] = "idle"
         if worker_name:
             update["name"] = str(worker_name)
         STATE["workers"][wid].update(update)
@@ -613,7 +651,8 @@ def worker_job():
         with lock:
             STATE["workers"][wid].update({"status": STATUS_MINING, "job_id": job["job_id"], "height": job["height"]})
             ensure_participant_locked(wid)
-            log(f"Job an {wid}: Height {job['height']} ExtraNonce {job['extranonce']}")
+            if bool(cfg().get("log_job_assignments", False)):
+                log(f"Job an {wid}: Height {job['height']} ExtraNonce {job['extranonce']}")
         return jsonify({"ok": True, "running": True, "job": job})
     except Exception as e:
         with lock:
@@ -1030,7 +1069,7 @@ body{font-family:system-ui,Arial;background:#0b1020;color:#e8eefc;margin:0}heade
 </style></head>
 <body><header><b>Bitcoin Miner Master Production Dashboard</b> <span id="run"></span></header><div class="wrap">
 <div class="card"><button onclick="post('/start')">Start</button><button class="danger" onclick="post('/stop')">Stop</button><button class="danger" onclick="post('/panic')">NOT-AUS</button><a class="button" href="/config">Config</a><a class="button" href="/blocks">Blocks/Rounds</a><span id="msg" class="small"></span></div>
-<div class="grid"><div class="card"><div class="label">Gesamt-Hashrate</div><div id="hr" class="value">—</div></div><div class="card"><div class="label">Worker online</div><div id="wc" class="value">—</div></div><div class="card"><div class="label">Blockhöhe</div><div id="height" class="value">—</div></div><div class="card"><div class="label">Laufzeit</div><div id="rt" class="value">—</div></div></div>
+<div class="grid"><div class="card"><div class="label">Gesamt-Hashrate</div><div id="hr" class="value">—</div></div><div class="card"><div class="label">Worker online</div><div id="wc" class="value">—</div></div><div class="card"><div class="label">Blockhöhe</div><div id="height" class="value">—</div></div><div class="card"><div class="label">Laufzeit</div><div id="rt" class="value">—</div></div><div class="card"><div class="label">Job-Cache</div><div id="jc" class="value">—</div></div></div>
 <div class="card"><h3>Worker</h3><table><thead><tr><th>Name</th><th>Status</th><th>GPU</th><th>Hashrate</th><th>Verifikation</th><th>GPU-Metriken</th><th>Tuning</th><th>Alter</th></tr></thead><tbody id="workers"></tbody></table></div>
 <div class="card"><h3>Leistungsverteilung</h3><div id="bars"></div></div>
 <div class="card"><h3>Aktuelle Round</h3><pre id="round"></pre></div><div class="card"><h3>Live-Log</h3><div id="logs" class="log"></div></div>
@@ -1042,11 +1081,11 @@ function dur(s){s=s||0;let h=Math.floor(s/3600),m=Math.floor((s%3600)/60),x=s%60
 async function post(u){let r=await fetch(u,{method:'POST'});document.getElementById('msg').textContent=await r.text();tick()}
 function metric(w){let g=(w.gpu_metrics||[])[0]||{}; if(!g.name)return '<span class="small">—</span>'; return `<div>${esc(g.temp_c)}°C · ${esc(g.util_percent)}% · ${esc(g.power_w)}W · ${esc(g.pstate)}</div><div class="small">VRAM ${esc(g.mem_used_mb)}/${esc(g.mem_total_mb)} MB</div>`}
 function tuning(w){return `<span class="pill">Batch ${esc(w.batch_size||'—')}</span> <span class="pill">Local ${esc(w.local_size||'—')}</span><div class="small">Nonce ${esc(w.nonce||'')}</div>`}
-async function tick(){let s=await (await fetch('/api/status')).json();document.getElementById('run').innerHTML=s.running?'<span class="ok">● RUNNING</span>':'<span class="bad">● STOPPED</span>';document.getElementById('hr').textContent=fmt(s.total_hashrate_hs);document.getElementById('height').textContent=s.height||'—';document.getElementById('rt').textContent=dur(s.runtime_seconds);let ws=Object.values(s.workers||{});document.getElementById('wc').textContent=(s.online_workers||0)+' / '+ws.length;document.getElementById('workers').innerHTML=ws.map(w=>`<tr><td><b>${esc(w.name||w.worker_id)}</b><div class="small">${esc(w.worker_id)}</div></td><td>${w.online?'<span class="ok">online</span>':'<span class="bad">offline</span>'}<br>${esc(w.status||'')}</td><td>${esc(w.gpu_device||'')}<div class="small">${esc(w.backend||'')}</div></td><td><b>${fmt(w.verified_hashrate_hs||w.hashrate_hs||0)}</b><div class="small">Anzeige ${fmt(w.hashrate_hs||0)}</div></td><td><div>${Number(w.last_interval_hashes||0).toLocaleString()} Nonces</div><div class="small">in ${Number(w.last_interval_seconds||0).toFixed(3)}s · Batches ${Number(w.completed_batches||0).toLocaleString()}</div></td><td>${metric(w)}</td><td>${tuning(w)}</td><td>${w.age_seconds||0}s</td></tr>`).join('');let max=Math.max(1,...ws.map(w=>Number((w.verified_hashrate_hs||w.hashrate_hs)||0)));document.getElementById('bars').innerHTML=ws.map(w=>`<div style="margin:8px 0"><b>${esc(w.name||w.worker_id)}</b> <span class="small">${fmt(w.hashrate_hs||0)}</span><div class="bar"><span style="width:${Math.max(1,100*Number((w.verified_hashrate_hs||w.hashrate_hs)||0)/max)}%"></span></div></div>`).join('');document.getElementById('logs').innerHTML=(s.logs||[]).slice(-80).map(l=>`<div><span class="small">${esc(l.ts)}</span> ${esc(l.msg)}</div>`).join('');let lg=document.getElementById('logs');lg.scrollTop=lg.scrollHeight;document.getElementById('round').textContent=JSON.stringify(s.current_round||{},null,2);document.getElementById('err').textContent=JSON.stringify({last_error:s.last_error,last_submit_result:s.last_submit_result},null,2)}
+async function tick(){let s=await (await fetch('/api/status')).json();document.getElementById('run').innerHTML=s.running?'<span class="ok">● RUNNING</span>':'<span class="bad">● STOPPED</span>';document.getElementById('hr').textContent=fmt(s.total_hashrate_hs);document.getElementById('height').textContent=s.height||'—';document.getElementById('rt').textContent=dur(s.runtime_seconds);document.getElementById('jc').textContent=s.cached_jobs??'—';let ws=Object.values(s.workers||{}).sort((a,b)=>String(a.name||a.worker_id).localeCompare(String(b.name||b.worker_id)));document.getElementById('wc').textContent=(s.online_workers||0)+' / '+ws.length;document.getElementById('workers').innerHTML=ws.map(w=>`<tr><td><b>${esc(w.name||w.worker_id)}</b><div class="small">${esc(w.worker_id)}</div></td><td>${w.online?'<span class="ok">online</span>':'<span class="bad">offline</span>'}<br>${esc(w.status||'')}</td><td>${esc(w.gpu_device||'')}<div class="small">${esc(w.backend||'')}</div></td><td><b>${fmt(w.verified_hashrate_hs||w.hashrate_hs||0)}</b><div class="small">Anzeige ${fmt(w.hashrate_hs||0)}</div></td><td><div>${Number(w.last_interval_hashes||0).toLocaleString()} Nonces</div><div class="small">in ${Number(w.last_interval_seconds||0).toFixed(3)}s · Batches ${Number(w.completed_batches||0).toLocaleString()}</div></td><td>${metric(w)}</td><td>${tuning(w)}</td><td>${w.age_seconds||0}s</td></tr>`).join('');let max=Math.max(1,...ws.map(w=>Number((w.verified_hashrate_hs||w.hashrate_hs)||0)));document.getElementById('bars').innerHTML=ws.map(w=>`<div style="margin:8px 0"><b>${esc(w.name||w.worker_id)}</b> <span class="small">${fmt(w.hashrate_hs||0)}</span><div class="bar"><span style="width:${Math.max(1,100*Number((w.verified_hashrate_hs||w.hashrate_hs)||0)/max)}%"></span></div></div>`).join('');document.getElementById('logs').innerHTML=(s.logs||[]).slice(-80).map(l=>`<div><span class="small">${esc(l.ts)}</span> ${esc(l.msg)}</div>`).join('');let lg=document.getElementById('logs');lg.scrollTop=lg.scrollHeight;document.getElementById('round').textContent=JSON.stringify(s.current_round||{},null,2);document.getElementById('err').textContent=JSON.stringify({last_error:s.last_error,last_submit_result:s.last_submit_result},null,2)}
 setInterval(tick,1000);tick();</script></body></html>
 '''
 
-VERIFY_HTML = r'''<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Verify</title><style>body{font-family:system-ui;background:#0b1020;color:#e8eefc;margin:20px;line-height:1.45}.card{background:#111936;border:1px solid #26345f;border-radius:14px;padding:14px;margin:12px 0}table{width:100%;border-collapse:collapse}td,th{padding:8px;border-bottom:1px solid #26345f;text-align:left}button,a{background:#2563eb;color:white;border:0;border-radius:10px;padding:10px 14px;text-decoration:none;margin-right:8px}.small{color:#9fb0d0;font-size:.9rem}pre{background:#0b1020;border-radius:10px;padding:10px;white-space:pre-wrap}.ok{color:#34d399}.warn{color:#fbbf24}.bad{color:#fb7185}</style></head><body><h1>Production Dashboard</h1><p><a href="/">Zurück</a></p><div class="card"><h2>Cluster-Verifikation</h2><p>Diese Seite zeigt die Hashrate aus abgeschlossenen Worker-Intervallen: <code>last_interval_hashes / last_interval_seconds</code>. Das ist die maßgebliche Zahl, nicht eine optimistische Anzeige.</p><table><tbody id="summary"></tbody></table></div><div class="card"><h2>Worker-Rohdaten</h2><table><thead><tr><th>Worker</th><th>Status</th><th>Instant</th><th>Verified</th><th>Intervall-Nonces</th><th>Intervall-Sekunden</th><th>Batches</th><th>Abweichung</th></tr></thead><tbody id="workers"></tbody></table></div><div class="card"><h2>Bewertung</h2><pre id="judge"></pre></div><script>function esc(x){return String(x??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}function fmt(n){n=Number(n||0); if(n>1e9)return (n/1e9).toFixed(2)+' GH/s'; if(n>1e6)return (n/1e6).toFixed(2)+' MH/s'; if(n>1e3)return (n/1e3).toFixed(2)+' kH/s'; return n.toFixed(0)+' H/s'}async function tick(){let s=await(await fetch('/api/status')).json();let ws=Object.values(s.workers||{});let verified=ws.reduce((a,w)=>a+Number(w.verified_hashrate_hs||0),0);let instant=ws.reduce((a,w)=>a+Number(w.hashrate_hs||0),0);document.getElementById('summary').innerHTML=`<tr><td>Cluster verified</td><td><b>${fmt(verified)}</b></td></tr><tr><td>Cluster instant</td><td>${fmt(instant)}</td></tr><tr><td>Worker</td><td>${s.online_workers||0} online / ${ws.length} gesamt</td></tr><tr><td>Height</td><td>${esc(s.height||'—')}</td></tr>`;document.getElementById('workers').innerHTML=ws.map(w=>{let ih=Number(w.hashrate_hs||0), vh=Number(w.verified_hashrate_hs||0);let diff=vh?((ih-vh)/vh*100):0;let cls=Math.abs(diff)>15?'warn':'ok';return `<tr><td><b>${esc(w.name||w.worker_id)}</b><div class="small">${esc(w.gpu_device||'')}</div></td><td>${esc(w.status||'')}</td><td>${fmt(ih)}</td><td><b>${fmt(vh)}</b></td><td>${Number(w.last_interval_hashes||0).toLocaleString()}</td><td>${Number(w.last_interval_seconds||0).toFixed(3)}</td><td>${Number(w.completed_batches||0).toLocaleString()}</td><td class="${cls}">${diff.toFixed(1)}%</td></tr>`}).join('');let msg=[];for(let w of ws){let ih=Number(w.hashrate_hs||0), vh=Number(w.verified_hashrate_hs||0);if(vh>0 && Math.abs((ih-vh)/vh)>0.15)msg.push(`${w.name||w.worker_id}: Instant und Verified weichen deutlich ab.`);if(Number(w.last_interval_seconds||0)<0.5)msg.push(`${w.name||w.worker_id}: Messintervall sehr kurz; Wert kann springen.`)}if(!msg.length)msg.push('Keine auffällige Abweichung zwischen Instant und Verified.');document.getElementById('judge').textContent=msg.join('\n')}setInterval(tick,1000);tick()</script></body></html>'''
+VERIFY_HTML = r'''<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Verify</title><style>body{font-family:system-ui;background:#0b1020;color:#e8eefc;margin:20px;line-height:1.45}.card{background:#111936;border:1px solid #26345f;border-radius:14px;padding:14px;margin:12px 0}table{width:100%;border-collapse:collapse}td,th{padding:8px;border-bottom:1px solid #26345f;text-align:left}button,a{background:#2563eb;color:white;border:0;border-radius:10px;padding:10px 14px;text-decoration:none;margin-right:8px}.small{color:#9fb0d0;font-size:.9rem}pre{background:#0b1020;border-radius:10px;padding:10px;white-space:pre-wrap}.ok{color:#34d399}.warn{color:#fbbf24}.bad{color:#fb7185}</style></head><body><h1>Production Dashboard</h1><p><a href="/">Zurück</a></p><div class="card"><h2>Cluster-Verifikation</h2><p>Diese Seite zeigt die Hashrate aus abgeschlossenen Worker-Intervallen: <code>last_interval_hashes / last_interval_seconds</code>. Das ist die maßgebliche Zahl, nicht eine optimistische Anzeige.</p><table><tbody id="summary"></tbody></table></div><div class="card"><h2>Worker-Rohdaten</h2><table><thead><tr><th>Worker</th><th>Status</th><th>Instant</th><th>Verified</th><th>Intervall-Nonces</th><th>Intervall-Sekunden</th><th>Batches</th><th>Abweichung</th></tr></thead><tbody id="workers"></tbody></table></div><div class="card"><h2>Bewertung</h2><pre id="judge"></pre></div><script>function esc(x){return String(x??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}function fmt(n){n=Number(n||0); if(n>1e9)return (n/1e9).toFixed(2)+' GH/s'; if(n>1e6)return (n/1e6).toFixed(2)+' MH/s'; if(n>1e3)return (n/1e3).toFixed(2)+' kH/s'; return n.toFixed(0)+' H/s'}async function tick(){let s=await(await fetch('/api/status')).json();let ws=Object.values(s.workers||{}).sort((a,b)=>String(a.name||a.worker_id).localeCompare(String(b.name||b.worker_id)));let verified=ws.reduce((a,w)=>a+Number(w.verified_hashrate_hs||0),0);let instant=ws.reduce((a,w)=>a+Number(w.hashrate_hs||0),0);document.getElementById('summary').innerHTML=`<tr><td>Cluster verified</td><td><b>${fmt(verified)}</b></td></tr><tr><td>Cluster instant</td><td>${fmt(instant)}</td></tr><tr><td>Worker</td><td>${s.online_workers||0} online / ${ws.length} gesamt</td></tr><tr><td>Height</td><td>${esc(s.height||'—')}</td></tr>`;document.getElementById('workers').innerHTML=ws.map(w=>{let ih=Number(w.hashrate_hs||0), vh=Number(w.verified_hashrate_hs||0);let diff=vh?((ih-vh)/vh*100):0;let cls=Math.abs(diff)>15?'warn':'ok';return `<tr><td><b>${esc(w.name||w.worker_id)}</b><div class="small">${esc(w.gpu_device||'')}</div></td><td>${esc(w.status||'')}</td><td>${fmt(ih)}</td><td><b>${fmt(vh)}</b></td><td>${Number(w.last_interval_hashes||0).toLocaleString()}</td><td>${Number(w.last_interval_seconds||0).toFixed(3)}</td><td>${Number(w.completed_batches||0).toLocaleString()}</td><td class="${cls}">${diff.toFixed(1)}%</td></tr>`}).join('');let msg=[];for(let w of ws){let ih=Number(w.hashrate_hs||0), vh=Number(w.verified_hashrate_hs||0);if(vh>0 && Math.abs((ih-vh)/vh)>0.15)msg.push(`${w.name||w.worker_id}: Instant und Verified weichen deutlich ab.`);if(Number(w.last_interval_seconds||0)<0.5)msg.push(`${w.name||w.worker_id}: Messintervall sehr kurz; Wert kann springen.`)}if(!msg.length)msg.push('Keine auffällige Abweichung zwischen Instant und Verified.');document.getElementById('judge').textContent=msg.join('\n')}setInterval(tick,1000);tick()</script></body></html>'''
 
 
 BENCHMARK_HTML = r"""<!doctype html>
