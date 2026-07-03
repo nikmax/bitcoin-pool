@@ -5,7 +5,7 @@ services:
     restart: unless-stopped
     volumes:
       - ./:/btc
-      - ./config.json:/btc/pool/config.json
+      - ./config.json:/btc/pool/config.json:rw
     ports:
       - "8080:8080"
     command:
