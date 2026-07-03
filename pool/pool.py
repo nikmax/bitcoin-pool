@@ -453,6 +453,9 @@ def alloc_job(worker_id):
         JOBS[job_id] = job
         ACTIVE_JOB_BY_WORKER[worker_id] = job_id
     public = {k: job[k] for k in ["job_id", "template_id", "round_id", "height", "transactions", "previousblockhash", "bits", "target_hex", "header_prefix_hex", "extranonce"]}
+    public["nonce_start"] = 0
+    public["nonce_end"] = 0xffffffff
+    public["nonce_count"] = 0x100000000
     public["max_nonce"] = 0xffffffff
     public["recommended_batch_size"] = int(cfg().get("gpu_batch_size", 262144))
     return public
