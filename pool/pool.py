@@ -60,29 +60,22 @@ STATE = {
     "verify_started_at": None,
     "verified_total_hashes": 0,
 }
-JOBS = {}
-JOB_CREATED_AT = {}
+# Active jobs are now strictly on-demand: one active job per worker.
+# This prevents RAM growth when the master runs for days and prevents jobs
+# from being generated while no worker is connected. Full templates can contain
+# large transaction hex strings, so keeping historical jobs in RAM is dangerous.
+JOBS = {}  # job_id -> full job, only for currently active worker jobs
+ACTIVE_JOB_BY_WORKER = {}  # worker_id -> job_id
 
-def job_limits():
-    c = cfg()
-    return int(c.get("max_cached_jobs", 500)), int(c.get("max_cached_job_age_seconds", 900))
+def drop_worker_job_locked(worker_id):
+    """Drop the current active job for a worker, if any."""
+    old_job_id = ACTIVE_JOB_BY_WORKER.pop(worker_id, None)
+    if old_job_id:
+        JOBS.pop(old_job_id, None)
 
-def prune_jobs_locked():
-    """Keep the in-memory job cache bounded. Full templates can contain large
-    transaction hex strings, so retaining every assigned job will slowly fill RAM.
-    We keep recent jobs long enough for late found messages, then drop old ones.
-    """
-    now = time.time()
-    max_jobs, max_age = job_limits()
-    for jid, ts in list(JOB_CREATED_AT.items()):
-        if now - float(ts or 0) > max_age:
-            JOB_CREATED_AT.pop(jid, None)
-            JOBS.pop(jid, None)
-    overflow = max(0, len(JOBS) - max_jobs)
-    if overflow:
-        for jid in list(JOBS.keys())[:overflow]:
-            JOBS.pop(jid, None)
-            JOB_CREATED_AT.pop(jid, None)
+def clear_all_jobs_locked():
+    JOBS.clear()
+    ACTIVE_JOB_BY_WORKER.clear()
 
 BENCHMARK = {
     "running": False,
@@ -425,12 +418,8 @@ def refresh_template(force=False):
                 EXTRANONCE = 0
             start_round_locked(round_id, tmpl, template_id=template_id, force_new=force)
             # On a new chain tip/manual start, old jobs are stale and can be dropped.
-            # This avoids retaining full-template transaction data indefinitely.
-            if force:
-                JOBS.clear()
-                JOB_CREATED_AT.clear()
-            else:
-                prune_jobs_locked()
+            # Jobs are assigned on demand; no jobs are generated without workers.
+            clear_all_jobs_locked()
     return ACTIVE_TEMPLATE
 
 def template_watcher():
@@ -458,9 +447,11 @@ def alloc_job(worker_id):
     job["template_id"] = STATE["template_id"]
     job["round_id"] = STATE.get("round_id")
     with lock:
+        # One active job per worker: assigning a new job immediately releases
+        # the old full-template job from memory.
+        drop_worker_job_locked(worker_id)
         JOBS[job_id] = job
-        JOB_CREATED_AT[job_id] = time.time()
-        prune_jobs_locked()
+        ACTIVE_JOB_BY_WORKER[worker_id] = job_id
     public = {k: job[k] for k in ["job_id", "template_id", "round_id", "height", "transactions", "previousblockhash", "bits", "target_hex", "header_prefix_hex", "extranonce"]}
     public["max_nonce"] = 0xffffffff
     public["recommended_batch_size"] = int(cfg().get("gpu_batch_size", 262144))
@@ -479,6 +470,7 @@ def cleanup_workers():
         for wid, w in list(STATE["workers"].items()):
             age = now - float(w.get("last_seen", 0) or 0)
             if age > remove_after:
+                drop_worker_job_locked(wid)
                 del STATE["workers"][wid]
             elif age > offline_after:
                 if w.get("online") or w.get("status") != STATUS_OFFLINE:
@@ -486,6 +478,7 @@ def cleanup_workers():
                     if p:
                         p["disconnects"] = int(p.get("disconnects", 0) or 0) + 1
                     add_round_event_locked("offline", wid, age_seconds=int(age))
+                drop_worker_job_locked(wid)
                 w["status"] = STATUS_OFFLINE
                 w["hashrate_hs"] = 0.0
                 w["verified_hashrate_hs"] = 0.0
@@ -528,7 +521,8 @@ def snapshot():
     s["verified_total_hashes"] = sum(int(w.get("total_hashes", 0) or 0) for w in s["workers"].values() if w.get("online"))
     s["verify_worker_count"] = len(s.get("workers", {}))
     with lock:
-        s["cached_jobs"] = len(JOBS)
+        s["active_jobs"] = len(JOBS)
+        s["cached_jobs"] = len(JOBS)  # backward-compatible dashboard field
     with lock:
         s["current_round"] = round_summary_locked(CURRENT_ROUND)
         s["recent_blocks"] = copy.deepcopy(COMPLETED_BLOCKS[-20:])
@@ -565,6 +559,7 @@ def start():
 def stop():
     with lock:
         STATE["running"] = False
+        clear_all_jobs_locked()
         for w in STATE.get("workers", {}).values():
             w["hashrate_hs"] = 0.0
             w["verified_hashrate_hs"] = 0.0
@@ -577,6 +572,7 @@ def stop():
 def panic():
     with lock:
         STATE["running"] = False
+        clear_all_jobs_locked()
         STATE["last_error"] = "PANIC STOP gedrückt: Master verteilt keine Jobs mehr."
         for w in STATE.get("workers", {}).values():
             w["hashrate_hs"] = 0.0
@@ -733,6 +729,12 @@ def worker_found():
         return jsonify({"ok": False, "error": "invalid nonce"}), 400
     with lock:
         job = JOBS.get(job_id)
+        # The found message consumes this job. Keep the local copy for block
+        # building/submission, but free the cache slot immediately.
+        if job and found_worker_id:
+            if ACTIVE_JOB_BY_WORKER.get(found_worker_id) == job_id:
+                ACTIVE_JOB_BY_WORKER.pop(found_worker_id, None)
+            JOBS.pop(job_id, None)
     if not job:
         return jsonify({"ok": False, "error": "unknown job"}), 404
 
@@ -1069,7 +1071,7 @@ body{font-family:system-ui,Arial;background:#0b1020;color:#e8eefc;margin:0}heade
 </style></head>
 <body><header><b>Bitcoin Miner Master Production Dashboard</b> <span id="run"></span></header><div class="wrap">
 <div class="card"><button onclick="post('/start')">Start</button><button class="danger" onclick="post('/stop')">Stop</button><button class="danger" onclick="post('/panic')">NOT-AUS</button><a class="button" href="/config">Config</a><a class="button" href="/blocks">Blocks/Rounds</a><span id="msg" class="small"></span></div>
-<div class="grid"><div class="card"><div class="label">Gesamt-Hashrate</div><div id="hr" class="value">—</div></div><div class="card"><div class="label">Worker online</div><div id="wc" class="value">—</div></div><div class="card"><div class="label">Blockhöhe</div><div id="height" class="value">—</div></div><div class="card"><div class="label">Laufzeit</div><div id="rt" class="value">—</div></div><div class="card"><div class="label">Job-Cache</div><div id="jc" class="value">—</div></div></div>
+<div class="grid"><div class="card"><div class="label">Gesamt-Hashrate</div><div id="hr" class="value">—</div></div><div class="card"><div class="label">Worker online</div><div id="wc" class="value">—</div></div><div class="card"><div class="label">Blockhöhe</div><div id="height" class="value">—</div></div><div class="card"><div class="label">Laufzeit</div><div id="rt" class="value">—</div></div><div class="card"><div class="label">Aktive Jobs</div><div id="jc" class="value">—</div></div></div>
 <div class="card"><h3>Worker</h3><table><thead><tr><th>Name</th><th>Status</th><th>GPU</th><th>Hashrate</th><th>Verifikation</th><th>GPU-Metriken</th><th>Tuning</th><th>Alter</th></tr></thead><tbody id="workers"></tbody></table></div>
 <div class="card"><h3>Leistungsverteilung</h3><div id="bars"></div></div>
 <div class="card"><h3>Aktuelle Round</h3><pre id="round"></pre></div><div class="card"><h3>Live-Log</h3><div id="logs" class="log"></div></div>
@@ -1081,7 +1083,7 @@ function dur(s){s=s||0;let h=Math.floor(s/3600),m=Math.floor((s%3600)/60),x=s%60
 async function post(u){let r=await fetch(u,{method:'POST'});document.getElementById('msg').textContent=await r.text();tick()}
 function metric(w){let g=(w.gpu_metrics||[])[0]||{}; if(!g.name)return '<span class="small">—</span>'; return `<div>${esc(g.temp_c)}°C · ${esc(g.util_percent)}% · ${esc(g.power_w)}W · ${esc(g.pstate)}</div><div class="small">VRAM ${esc(g.mem_used_mb)}/${esc(g.mem_total_mb)} MB</div>`}
 function tuning(w){return `<span class="pill">Batch ${esc(w.batch_size||'—')}</span> <span class="pill">Local ${esc(w.local_size||'—')}</span><div class="small">Nonce ${esc(w.nonce||'')}</div>`}
-async function tick(){let s=await (await fetch('/api/status')).json();document.getElementById('run').innerHTML=s.running?'<span class="ok">● RUNNING</span>':'<span class="bad">● STOPPED</span>';document.getElementById('hr').textContent=fmt(s.total_hashrate_hs);document.getElementById('height').textContent=s.height||'—';document.getElementById('rt').textContent=dur(s.runtime_seconds);document.getElementById('jc').textContent=s.cached_jobs??'—';let ws=Object.values(s.workers||{}).sort((a,b)=>String(a.name||a.worker_id).localeCompare(String(b.name||b.worker_id)));document.getElementById('wc').textContent=(s.online_workers||0)+' / '+ws.length;document.getElementById('workers').innerHTML=ws.map(w=>`<tr><td><b>${esc(w.name||w.worker_id)}</b><div class="small">${esc(w.worker_id)}</div></td><td>${w.online?'<span class="ok">online</span>':'<span class="bad">offline</span>'}<br>${esc(w.status||'')}</td><td>${esc(w.gpu_device||'')}<div class="small">${esc(w.backend||'')}</div></td><td><b>${fmt(w.verified_hashrate_hs||w.hashrate_hs||0)}</b><div class="small">Anzeige ${fmt(w.hashrate_hs||0)}</div></td><td><div>${Number(w.last_interval_hashes||0).toLocaleString()} Nonces</div><div class="small">in ${Number(w.last_interval_seconds||0).toFixed(3)}s · Batches ${Number(w.completed_batches||0).toLocaleString()}</div></td><td>${metric(w)}</td><td>${tuning(w)}</td><td>${w.age_seconds||0}s</td></tr>`).join('');let max=Math.max(1,...ws.map(w=>Number((w.verified_hashrate_hs||w.hashrate_hs)||0)));document.getElementById('bars').innerHTML=ws.map(w=>`<div style="margin:8px 0"><b>${esc(w.name||w.worker_id)}</b> <span class="small">${fmt(w.hashrate_hs||0)}</span><div class="bar"><span style="width:${Math.max(1,100*Number((w.verified_hashrate_hs||w.hashrate_hs)||0)/max)}%"></span></div></div>`).join('');document.getElementById('logs').innerHTML=(s.logs||[]).slice(-80).map(l=>`<div><span class="small">${esc(l.ts)}</span> ${esc(l.msg)}</div>`).join('');let lg=document.getElementById('logs');lg.scrollTop=lg.scrollHeight;document.getElementById('round').textContent=JSON.stringify(s.current_round||{},null,2);document.getElementById('err').textContent=JSON.stringify({last_error:s.last_error,last_submit_result:s.last_submit_result},null,2)}
+async function tick(){let s=await (await fetch('/api/status')).json();document.getElementById('run').innerHTML=s.running?'<span class="ok">● RUNNING</span>':'<span class="bad">● STOPPED</span>';document.getElementById('hr').textContent=fmt(s.total_hashrate_hs);document.getElementById('height').textContent=s.height||'—';document.getElementById('rt').textContent=dur(s.runtime_seconds);document.getElementById('jc').textContent=s.active_jobs??s.cached_jobs??'—';let ws=Object.values(s.workers||{}).sort((a,b)=>String(a.name||a.worker_id).localeCompare(String(b.name||b.worker_id)));document.getElementById('wc').textContent=(s.online_workers||0)+' / '+ws.length;document.getElementById('workers').innerHTML=ws.map(w=>`<tr><td><b>${esc(w.name||w.worker_id)}</b><div class="small">${esc(w.worker_id)}</div></td><td>${w.online?'<span class="ok">online</span>':'<span class="bad">offline</span>'}<br>${esc(w.status||'')}</td><td>${esc(w.gpu_device||'')}<div class="small">${esc(w.backend||'')}</div></td><td><b>${fmt(w.verified_hashrate_hs||w.hashrate_hs||0)}</b><div class="small">Anzeige ${fmt(w.hashrate_hs||0)}</div></td><td><div>${Number(w.last_interval_hashes||0).toLocaleString()} Nonces</div><div class="small">in ${Number(w.last_interval_seconds||0).toFixed(3)}s · Batches ${Number(w.completed_batches||0).toLocaleString()}</div></td><td>${metric(w)}</td><td>${tuning(w)}</td><td>${w.age_seconds||0}s</td></tr>`).join('');let max=Math.max(1,...ws.map(w=>Number((w.verified_hashrate_hs||w.hashrate_hs)||0)));document.getElementById('bars').innerHTML=ws.map(w=>`<div style="margin:8px 0"><b>${esc(w.name||w.worker_id)}</b> <span class="small">${fmt(w.hashrate_hs||0)}</span><div class="bar"><span style="width:${Math.max(1,100*Number((w.verified_hashrate_hs||w.hashrate_hs)||0)/max)}%"></span></div></div>`).join('');document.getElementById('logs').innerHTML=(s.logs||[]).slice(-80).map(l=>`<div><span class="small">${esc(l.ts)}</span> ${esc(l.msg)}</div>`).join('');let lg=document.getElementById('logs');lg.scrollTop=lg.scrollHeight;document.getElementById('round').textContent=JSON.stringify(s.current_round||{},null,2);document.getElementById('err').textContent=JSON.stringify({last_error:s.last_error,last_submit_result:s.last_submit_result},null,2)}
 setInterval(tick,1000);tick();</script></body></html>
 '''
 
