@@ -3,7 +3,6 @@
   "rpc_url": "http://127.0.0.1:8332",
   "rpc_user": "bitcoinrpc",
   "rpc_pass": "change-me",
-  "mining_address": "bc1qreplace-with-your-address",
   "web_host": "0.0.0.0",
   "web_port": 8080,
   "mining_address": "bc1quwr5vhct5th95lywszej79392qahux4qj0tljs",
