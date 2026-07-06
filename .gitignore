@@ -1,4 +1,4 @@
 config.json
 config.json.privatnet
 pool/config.json
-pool/logs/*
+pool/__pychache__
