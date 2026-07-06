@@ -2,3 +2,5 @@ config.json
 config.json.privatnet
 pool/config.json
 pool/__pychache__
+shared/__pychache__
+pool/logs/*
