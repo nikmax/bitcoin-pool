@@ -1,6 +1,6 @@
 config.json
 pool/config.json
-pool/logs/*
+data
 
 shared/__pychache__
 pool/__pycache__
@@ -10,4 +10,3 @@ pool/web/__pycache__
 pool/workers/__pycache__
 shared/kernels/__pycache__
 tools/__pycache__
-

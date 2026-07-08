@@ -18,8 +18,9 @@ app = Flask(__name__)
 lock = threading.RLock()
 LOG_DIR = Path(os.environ.get("MINER_LOG_DIR", "logs"))
 ROUND_LOG = LOG_DIR / "rounds.jsonl"
-BLOCK_LOG = LOG_DIR / "blocks.jsonl"
-EVENT_LOG = LOG_DIR / "events.jsonl"
+# blocks.jsonl is deprecated: block/round history is now stored only in rounds.jsonl.
+# Existing blocks.jsonl files are ignored and no longer written.
+EVENT_LOG = LOG_DIR / "events.log"
 BENCH_LOG = LOG_DIR / "benchmarks.jsonl"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -117,6 +118,26 @@ def append_jsonl(path, obj):
     except Exception as e:
         print(f"JSONL log error {path}: {e}")
 
+def append_event_log(event_type, round_id=None, worker_id=None, **extra):
+    """Human-readable operational log.
+
+    Accounting data stays in rounds.jsonl. This file is only for debugging and
+    can be rotated/deleted without losing payout/block history.
+    """
+    try:
+        bits = [now_iso(), str(event_type)]
+        if round_id:
+            bits.append(f"round={round_id}")
+        if worker_id:
+            bits.append(f"worker={worker_id}")
+        for k, v in extra.items():
+            if v is not None:
+                bits.append(f"{k}={v}")
+        with open(EVENT_LOG, "a", encoding="utf-8") as f:
+            f.write(" | ".join(bits) + "\n")
+    except Exception as e:
+        print(f"event log error {EVENT_LOG}: {e}")
+
 def now_iso():
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
@@ -138,7 +159,7 @@ def add_round_event_locked(event_type, worker_id=None, **extra):
     if CURRENT_ROUND is not None:
         CURRENT_ROUND.setdefault("events", []).append(ev)
         CURRENT_ROUND["events"] = CURRENT_ROUND["events"][-500:]
-    append_jsonl(EVENT_LOG, {"round_id": CURRENT_ROUND.get("round_id") if CURRENT_ROUND else None, **ev})
+    append_event_log(event_type, round_id=CURRENT_ROUND.get("round_id") if CURRENT_ROUND else None, worker_id=worker_id, **extra)
 
 def ensure_participant_locked(worker_id):
     if CURRENT_ROUND is None or not worker_id:
@@ -206,7 +227,7 @@ def start_round_locked(round_id, tmpl, template_id=None, force_new=False):
         "events": [],
     }
     STATE["current_round"] = round_summary_locked(CURRENT_ROUND)
-    append_jsonl(EVENT_LOG, {"round_id": round_id, "ts": now_iso(), "event": "round_started", "height": tmpl.get("height"), "previousblockhash": tmpl.get("previousblockhash"), "force_new": bool(force_new)})
+    append_event_log("round_started", round_id=round_id, height=tmpl.get("height"), previousblockhash=tmpl.get("previousblockhash"), force_new=bool(force_new))
 
 def add_worker_delta_locked(worker_id, data):
     p = ensure_participant_locked(worker_id)
@@ -257,7 +278,7 @@ def finalize_round_for_block_locked(worker_id, job_id, nonce, submit_result):
     add_round_event_locked("block_found", worker_id, job_id=job_id, nonce=nonce, submitblock=submit_result)
     summary = round_summary_locked(CURRENT_ROUND)
     append_jsonl(ROUND_LOG, summary)
-    append_jsonl(BLOCK_LOG, summary)
+    append_event_log("block_found", round_id=round_id, worker_id=worker_id, job_id=job_id, nonce=nonce, submitblock=submit_result)
     COMPLETED_BLOCKS.append(summary)
     COMPLETED_BLOCKS = COMPLETED_BLOCKS[-100:]
     if round_id:
@@ -610,7 +631,7 @@ def snapshot():
         s["cached_jobs"] = len(JOBS)  # backward-compatible dashboard field
     with lock:
         s["current_round"] = round_summary_locked(CURRENT_ROUND)
-        s["recent_blocks"] = copy.deepcopy(COMPLETED_BLOCKS[-20:])
+        s["recent_blocks"] = recent_block_rounds(20)
         s["benchmark"] = benchmark_snapshot_locked()
     c = cfg()
     s["active_rpc_profile"] = c.get("active_rpc_profile")
@@ -1102,9 +1123,12 @@ def worker_history():
     with lock:
         blocks = list(COMPLETED_BLOCKS[-max(limit, 1):])
     if len(blocks) < limit:
-        # Nach Master-Neustart kommen alte Rounds aus blocks.jsonl.
+        # Nach Master-Neustart kommen abgeschlossene Block-Rounds aus rounds.jsonl.
+        # blocks.jsonl ist seit 3.0.6 nur noch ein alter, ignorierter Legacy-Export.
         seen = {b.get("round_id") for b in blocks}
-        for b in read_jsonl_tail(BLOCK_LOG, limit * 3):
+        for b in read_jsonl_tail(ROUND_LOG, limit * 5):
+            if b.get("end_reason") != "block_found":
+                continue
             if b.get("round_id") not in seen:
                 blocks.append(b)
                 seen.add(b.get("round_id"))
@@ -1159,11 +1183,30 @@ def worker_history():
         }
     })
 
+def recent_block_rounds(limit=100):
+    """Return recent accepted block rounds from memory plus rounds.jsonl.
+
+    rounds.jsonl is the single source of accounting truth. We keep a short
+    in-memory list for speed, but after restart we rebuild the view from the
+    round log instead of the deprecated blocks.jsonl.
+    """
+    with lock:
+        rows = list(COMPLETED_BLOCKS[-limit:])
+    if len(rows) < limit:
+        seen = {r.get("round_id") for r in rows}
+        for r in read_jsonl_tail(ROUND_LOG, limit * 5):
+            if r.get("end_reason") != "block_found":
+                continue
+            if r.get("round_id") not in seen:
+                rows.append(r)
+                seen.add(r.get("round_id"))
+    rows.sort(key=lambda x: str(x.get("ended_at") or x.get("started_at") or ""))
+    return rows[-limit:]
+
 @app.route("/api/rounds")
 @require_dashboard_auth
 def api_rounds():
-    with lock:
-        return jsonify({"ok": True, "current_round": round_summary_locked(CURRENT_ROUND), "recent_blocks": copy.deepcopy(COMPLETED_BLOCKS[-100:])})
+    return jsonify({"ok": True, "current_round": round_summary_locked(CURRENT_ROUND), "recent_blocks": recent_block_rounds(100)})
 
 @app.route("/blocks")
 @require_dashboard_auth
