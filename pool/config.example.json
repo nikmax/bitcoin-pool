@@ -1,21 +1,37 @@
 {
   "network": "mainnet",
-  "rpc_url": "http://127.0.0.1:8332",
-  "rpc_user": "bitcoinrpc",
-  "rpc_pass": "change-me",
   "web_host": "0.0.0.0",
   "web_port": 8080,
-  "mining_address": "bc1quwr5vhct5th95lywszej79392qahux4qj0tljs",
-  "worker_token": "front-phonics-wand-resident-consuming-unhinge-setback-motion-detached-abnormal-saturate-oink",
+  "worker_token": "change-this-long-random-token",
   "gpu_batch_size": 262144,
   "worker_offline_after_seconds": 20,
   "worker_remove_after_seconds": 120,
-  "version": "master-3.0.2",
-  "note": "Master 3.0.2: on-demand jobs; exactly one active full-template job per worker; no job growth without workers.",
+  "safety_note": "v0.3.7: Worker bremsen/stoppen lokal über max_gpu_temp_c; Master hat NOT-AUS /panic.",
+  "version": "master-3.0.4",
+  "note": "Master 3.0.4: RPC profiles, wallet autoload, favicon route, wallet RPC URL support.",
   "worker_hashrate_stale_after_seconds": 8,
   "dashboard_auth_enabled": true,
   "dashboard_user": "admin",
   "dashboard_password_hash": "e2186dbdb1bb4193608605e84f33208765b5693b55edd4f730a719a100eeea6f",
   "worker_name_unique_enforced": true,
-  "log_job_assignments": false
+  "log_job_assignments": false,
+  "active_rpc_profile": "main",
+  "rpc_profiles": {
+    "main": {
+      "label": "Privates Mainnet",
+      "rpc_url": "http://127.0.0.1:8332",
+      "rpc_user": "bitcoinrpc",
+      "rpc_pass": "change-me",
+      "rpc_wallet": "",
+      "mining_address": "bc1qreplace-with-your-address"
+    },
+    "local-test": {
+      "label": "Lokaler Test",
+      "rpc_url": "http://127.0.0.1:8332",
+      "rpc_user": "bitcoinrpc",
+      "rpc_pass": "change-me",
+      "rpc_wallet": "",
+      "mining_address": "bc1qreplace-with-your-address"
+    }
+  }
 }

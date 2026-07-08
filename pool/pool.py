@@ -2,7 +2,8 @@
 import json, os, time, threading, secrets, copy, hashlib, traceback
 from pathlib import Path
 import requests
-from flask import Flask, jsonify, request, render_template_string, redirect, Response
+from urllib.parse import quote
+from flask import Flask, jsonify, request, render_template_string, redirect, Response, send_file
 
 import sys
 sys.path.append(str(Path(__file__).resolve().parents[1]))
@@ -11,6 +12,8 @@ from shared.config import load_json_config, save_json_config
 from shared.protocol import STATUS_REGISTERED, STATUS_OFFLINE, STATUS_MINING, STATUS_FOUND
 
 CONFIG_PATH = Path(os.environ.get("MINER_MASTER_CONFIG", "config.json"))
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+MASTER_ROOT = Path(__file__).resolve().parent
 app = Flask(__name__)
 lock = threading.RLock()
 LOG_DIR = Path(os.environ.get("MINER_LOG_DIR", "logs"))
@@ -320,13 +323,60 @@ def benchmark_watchdog():
             log(msg)
 
 def load_config():
-    return load_json_config(CONFIG_PATH)
+    return normalize_config(load_json_config(CONFIG_PATH))
 
 def save_config(cfg):
-    save_json_config(CONFIG_PATH, cfg)
+    save_json_config(CONFIG_PATH, normalize_config(cfg))
 
 def cfg():
     return load_config()
+
+def normalize_config(c):
+    """Backward-compatible RPC profile normalization.
+
+    New format:
+      active_rpc_profile: "main"
+      rpc_profiles: {"main": {rpc_url, rpc_user, rpc_pass, rpc_wallet, mining_address}}
+
+    Old top-level rpc_url/rpc_user/rpc_pass/mining_address keys are kept as a
+    profile named "default" so existing configs continue to work.
+    """
+    c = dict(c or {})
+    profiles = c.get("rpc_profiles")
+    if not isinstance(profiles, dict) or not profiles:
+        profiles = {
+            "default": {
+                "label": "default",
+                "rpc_url": c.get("rpc_url", "http://127.0.0.1:8332"),
+                "rpc_user": c.get("rpc_user", "bitcoinrpc"),
+                "rpc_pass": c.get("rpc_pass", "change-me"),
+                "rpc_wallet": c.get("rpc_wallet", ""),
+                "mining_address": c.get("mining_address", ""),
+            }
+        }
+        c["rpc_profiles"] = profiles
+    active = c.get("active_rpc_profile") or next(iter(profiles.keys()))
+    if active not in profiles:
+        active = next(iter(profiles.keys()))
+    c["active_rpc_profile"] = active
+    p = dict(profiles.get(active) or {})
+    for key in ("rpc_url", "rpc_user", "rpc_pass", "rpc_wallet", "mining_address"):
+        if key in p:
+            c[key] = p.get(key)
+    return c
+
+def active_rpc_profile(c=None):
+    c = normalize_config(c or cfg())
+    return dict(c.get("rpc_profiles", {}).get(c.get("active_rpc_profile"), {}))
+
+def wallet_rpc_url(base_url, wallet_name):
+    base = str(base_url or "").rstrip("/")
+    wallet = str(wallet_name or "").strip().strip("/")
+    if not wallet:
+        return base
+    if "/wallet/" in base:
+        return base
+    return base + "/wallet/" + quote(wallet, safe="")
 
 def sha256_hex(text):
     return hashlib.sha256(str(text).encode("utf-8")).hexdigest()
@@ -360,15 +410,22 @@ def require_dashboard_auth(fn):
     wrapper.__name__ = fn.__name__
     return wrapper
 
-def rpc(method, params=None, timeout=60):
+WALLET_RPC_METHODS = {
+    "getaddressinfo", "getnewaddress", "generatetoaddress", "getwalletinfo",
+    "listtransactions", "sendtoaddress", "sendmany", "createwallet",
+}
+
+def rpc(method, params=None, timeout=60, use_wallet=None):
     c = cfg()
-    r = requests.post(c["rpc_url"], auth=(c["rpc_user"], c["rpc_pass"]), json={
+    p = active_rpc_profile(c)
+    wallet = p.get("rpc_wallet") or c.get("rpc_wallet") or ""
+    if use_wallet is None:
+        use_wallet = bool(wallet) and (method in WALLET_RPC_METHODS)
+    url = wallet_rpc_url(p.get("rpc_url") or c.get("rpc_url"), wallet) if use_wallet else str(p.get("rpc_url") or c.get("rpc_url")).rstrip("/")
+    r = requests.post(url, auth=(p.get("rpc_user") or c.get("rpc_user"), p.get("rpc_pass") or c.get("rpc_pass")), json={
         "jsonrpc": "1.0", "id": "miner-master", "method": method, "params": params or []
     }, timeout=timeout)
 
-    # Bitcoin Core may return JSON-RPC errors with HTTP 500.
-    # Parse JSON first so the dashboard/logs show the real RPC error
-    # instead of only "500 Server Error".
     try:
         data = r.json()
     except Exception:
@@ -384,6 +441,18 @@ def rpc(method, params=None, timeout=60):
     r.raise_for_status()
     return data["result"]
 
+def ensure_wallet_loaded():
+    p = active_rpc_profile()
+    wallet = str(p.get("rpc_wallet") or "").strip().strip("/")
+    if not wallet:
+        return {"wallet": None, "loaded": None}
+    loaded = rpc("listwallets", [], use_wallet=False)
+    if wallet in loaded:
+        return {"wallet": wallet, "loaded": True}
+    res = rpc("loadwallet", [wallet], timeout=120, use_wallet=False)
+    log(f"Wallet geladen: {wallet}")
+    return {"wallet": wallet, "loaded": False, "result": res}
+
 def token_ok():
     c = cfg()
     expected = c.get("worker_token", "")
@@ -397,28 +466,41 @@ def token_ok():
 def refresh_template(force=False):
     global ACTIVE_TEMPLATE, PAYOUT_SCRIPT, EXTRANONCE
     c = cfg()
+    p = active_rpc_profile(c)
+    ensure_wallet_loaded()
     if PAYOUT_SCRIPT is None or force:
-        info = rpc("getaddressinfo", [c["mining_address"]])
+        info = rpc("getaddressinfo", [p["mining_address"]], use_wallet=True)
         PAYOUT_SCRIPT = info["scriptPubKey"]
-    tmpl = rpc("getblocktemplate", [{"rules": ["segwit"]}])
-    template_id = f"{tmpl['height']}:{tmpl['previousblockhash']}:{tmpl.get('longpollid','')}"
+    tmpl = rpc("getblocktemplate", [{"rules": ["segwit"]}], use_wallet=False)
+    # IMPORTANT:
+    # Do not include longpollid / mempool update ids in template_id. Those can
+    # change frequently while the current block tip is still the same. If workers
+    # aborted on every such change, they would almost never finish the full
+    # 32-bit nonce range. template_id is therefore the *chain tip identity* and
+    # only changes when the next block really has a different height/prevhash,
+    # or on a manual force-start. Newer mempool templates may still be used for
+    # newly requested jobs, but already assigned jobs remain valid until the
+    # chain tip changes, stop/panic is pressed, or their nonce range is exhausted.
     chain_tip = f"{tmpl['height']}:{tmpl['previousblockhash']}"
+    template_id = chain_tip
     round_id = f"{chain_tip}:manual-{int(time.time()*1000)}" if force else chain_tip
     with lock:
-        if force or STATE.get("template_id") != template_id:
-            ACTIVE_TEMPLATE = tmpl
-            STATE.update({
-                "template_id": template_id,
-                "round_id": round_id,
-                "height": tmpl["height"],
-                "previousblockhash": tmpl["previousblockhash"],
-                "transactions": len(tmpl.get("transactions", [])),
-            })
+        tip_changed = STATE.get("template_id") != template_id
+        # Always keep the newest template for future jobs, but only invalidate
+        # active jobs when the chain tip changes or the operator explicitly
+        # forces a fresh start.
+        ACTIVE_TEMPLATE = tmpl
+        STATE.update({
+            "height": tmpl["height"],
+            "previousblockhash": tmpl["previousblockhash"],
+            "transactions": len(tmpl.get("transactions", [])),
+            "longpollid": tmpl.get("longpollid"),
+        })
+        if force or tip_changed:
+            STATE.update({"template_id": template_id, "round_id": round_id})
             if force:
                 EXTRANONCE = 0
             start_round_locked(round_id, tmpl, template_id=template_id, force_new=force)
-            # On a new chain tip/manual start, old jobs are stale and can be dropped.
-            # Jobs are assigned on demand; no jobs are generated without workers.
             clear_all_jobs_locked()
     return ACTIVE_TEMPLATE
 
@@ -530,12 +612,51 @@ def snapshot():
         s["current_round"] = round_summary_locked(CURRENT_ROUND)
         s["recent_blocks"] = copy.deepcopy(COMPLETED_BLOCKS[-20:])
         s["benchmark"] = benchmark_snapshot_locked()
+    c = cfg()
+    s["active_rpc_profile"] = c.get("active_rpc_profile")
+    s["rpc_profiles"] = {k: {"label": v.get("label", k), "rpc_url": v.get("rpc_url"), "rpc_wallet": v.get("rpc_wallet"), "mining_address": v.get("mining_address")} for k, v in (c.get("rpc_profiles") or {}).items()}
     return s
 
 @app.route("/")
 @require_dashboard_auth
 def index():
     return render_template_string(HTML)
+
+
+@app.route("/favicon.ico")
+def favicon():
+    for path in (PROJECT_ROOT / "favicon.ico", MASTER_ROOT / "favicon.ico"):
+        if path.exists():
+            return send_file(path)
+    return Response(status=204)
+
+@app.route("/api/rpc_profiles")
+@require_dashboard_auth
+def api_rpc_profiles():
+    c = cfg()
+    return jsonify({"ok": True, "active_rpc_profile": c.get("active_rpc_profile"), "rpc_profiles": c.get("rpc_profiles", {})})
+
+@app.route("/api/rpc_profile/select", methods=["POST"])
+@require_dashboard_auth
+def api_rpc_profile_select():
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name") or "").strip()
+    c = cfg()
+    profiles = c.get("rpc_profiles") or {}
+    if name not in profiles:
+        return jsonify({"ok": False, "error": f"unknown rpc profile: {name}"}), 400
+    with lock:
+        was_running = bool(STATE.get("running"))
+        STATE["running"] = False
+        clear_all_jobs_locked()
+    c["active_rpc_profile"] = name
+    save_config(c)
+    global ACTIVE_TEMPLATE, PAYOUT_SCRIPT, EXTRANONCE
+    ACTIVE_TEMPLATE = None
+    PAYOUT_SCRIPT = None
+    EXTRANONCE = 0
+    log(f"RPC-Profil gewechselt: {name}; Mining vorher gestoppt={was_running}")
+    return jsonify({"ok": True, "active_rpc_profile": name, "stopped_before_switch": was_running})
 
 @app.route("/api/status")
 @app.route("/status")
@@ -862,6 +983,10 @@ def api_regtest_newaddress():
     try:
         addr = rpc("getnewaddress", ["miner-v036", "bech32"])
         c = cfg()
+        p = active_rpc_profile(c)
+        profiles = c.setdefault("rpc_profiles", {})
+        active = c.get("active_rpc_profile")
+        profiles.setdefault(active, p)["mining_address"] = addr
         c["mining_address"] = addr
         save_config(c)
         PAYOUT_SCRIPT = None
@@ -1070,10 +1195,11 @@ def config_page():
 HTML = r'''
 <!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Miner Master Production Dashboard</title><style>
-body{font-family:system-ui,Arial;background:#0b1020;color:#e8eefc;margin:0}header{padding:16px 22px;background:#111936;border-bottom:1px solid #26345f}.wrap{padding:18px;max-width:1400px;margin:auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}.card{background:#111936;border:1px solid #26345f;border-radius:14px;padding:14px;margin-bottom:12px}.label{color:#9fb0d0;font-size:.85rem}.value{font-size:1.5rem;font-weight:700}button,a.button{background:#2563eb;color:white;border:0;border-radius:10px;padding:10px 14px;text-decoration:none;margin-right:8px;cursor:pointer}.danger{background:#dc2626}.ok{color:#34d399}.bad{color:#fb7185}.warn{color:#fbbf24}table{width:100%;border-collapse:collapse}td,th{padding:8px;border-bottom:1px solid #26345f;text-align:left;vertical-align:top}pre{white-space:pre-wrap}.bar{height:8px;background:#26345f;border-radius:8px;overflow:hidden}.bar>span{display:block;height:8px;background:#34d399}.small{font-size:.85rem;color:#9fb0d0}.log{height:170px;overflow:auto;background:#0b1020;border-radius:10px;padding:10px}.pill{display:inline-block;border-radius:999px;padding:2px 8px;background:#26345f;font-size:.8rem}
+body{font-family:system-ui,Arial;background:#0b1020;color:#e8eefc;margin:0}header{padding:16px 22px;background:#111936;border-bottom:1px solid #26345f}.wrap{padding:18px;max-width:1400px;margin:auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}.card{background:#111936;border:1px solid #26345f;border-radius:14px;padding:14px;margin-bottom:12px}.label{color:#9fb0d0;font-size:.85rem}.value{font-size:1.5rem;font-weight:700}button,a.button{background:#2563eb;color:white;border:0;border-radius:10px;padding:10px 14px;text-decoration:none;margin-right:8px;cursor:pointer}select{background:#0b1020;color:#e8eefc;border:1px solid #26345f;border-radius:8px;padding:8px}.danger{background:#dc2626}.ok{color:#34d399}.bad{color:#fb7185}.warn{color:#fbbf24}table{width:100%;border-collapse:collapse}td,th{padding:8px;border-bottom:1px solid #26345f;text-align:left;vertical-align:top}pre{white-space:pre-wrap}.bar{height:8px;background:#26345f;border-radius:8px;overflow:hidden}.bar>span{display:block;height:8px;background:#34d399}.small{font-size:.85rem;color:#9fb0d0}.log{height:170px;overflow:auto;background:#0b1020;border-radius:10px;padding:10px}.pill{display:inline-block;border-radius:999px;padding:2px 8px;background:#26345f;font-size:.8rem}
 </style></head>
 <body><header><b>Bitcoin Miner Master Production Dashboard</b> <span id="run"></span></header><div class="wrap">
 <div class="card"><button onclick="post('/start')">Start</button><button class="danger" onclick="post('/stop')">Stop</button><button class="danger" onclick="post('/panic')">NOT-AUS</button><a class="button" href="/config">Config</a><a class="button" href="/blocks">Blocks/Rounds</a><span id="msg" class="small"></span></div>
+<div class="card"><b>RPC-Profil</b> <select id="profile" onchange="selectProfile(this.value)"></select> <span id="profileInfo" class="small"></span><div class="small">Profilwechsel stoppt den Master vorher automatisch und lädt beim nächsten Start Wallet/Template neu.</div></div>
 <div class="grid"><div class="card"><div class="label">Gesamt-Hashrate</div><div id="hr" class="value">—</div></div><div class="card"><div class="label">Worker online</div><div id="wc" class="value">—</div></div><div class="card"><div class="label">Blockhöhe</div><div id="height" class="value">—</div></div><div class="card"><div class="label">Laufzeit</div><div id="rt" class="value">—</div></div><div class="card"><div class="label">Aktive Jobs</div><div id="jc" class="value">—</div></div></div>
 <div class="card"><h3>Worker</h3><table><thead><tr><th>Name</th><th>Status</th><th>GPU</th><th>Hashrate</th><th>Verifikation</th><th>GPU-Metriken</th><th>Tuning</th><th>Alter</th></tr></thead><tbody id="workers"></tbody></table></div>
 <div class="card"><h3>Leistungsverteilung</h3><div id="bars"></div></div>
@@ -1084,9 +1210,10 @@ function esc(x){return String(x??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;
 function fmt(n){n=Number(n||0); if(n>1e9)return (n/1e9).toFixed(2)+' GH/s'; if(n>1e6)return (n/1e6).toFixed(2)+' MH/s'; if(n>1e3)return (n/1e3).toFixed(2)+' kH/s'; return n.toFixed(0)+' H/s'}
 function dur(s){s=s||0;let h=Math.floor(s/3600),m=Math.floor((s%3600)/60),x=s%60;return `${h}h ${m}m ${x}s`}
 async function post(u){let r=await fetch(u,{method:'POST'});document.getElementById('msg').textContent=await r.text();tick()}
+async function selectProfile(name){let r=await fetch('/api/rpc_profile/select',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});document.getElementById('msg').textContent=await r.text();tick()}
 function metric(w){let g=(w.gpu_metrics||[])[0]||{}; if(!g.name)return '<span class="small">—</span>'; return `<div>${esc(g.temp_c)}°C · ${esc(g.util_percent)}% · ${esc(g.power_w)}W · ${esc(g.pstate)}</div><div class="small">VRAM ${esc(g.mem_used_mb)}/${esc(g.mem_total_mb)} MB</div>`}
 function tuning(w){return `<span class="pill">Batch ${esc(w.batch_size||'—')}</span> <span class="pill">Local ${esc(w.local_size||'—')}</span><div class="small">Nonce ${esc(w.nonce||'')}</div>`}
-async function tick(){let s=await (await fetch('/api/status')).json();document.getElementById('run').innerHTML=s.running?'<span class="ok">● RUNNING</span>':'<span class="bad">● STOPPED</span>';document.getElementById('hr').textContent=fmt(s.total_hashrate_hs);document.getElementById('height').textContent=s.height||'—';document.getElementById('rt').textContent=dur(s.runtime_seconds);document.getElementById('jc').textContent=s.active_jobs??s.cached_jobs??'—';let ws=Object.values(s.workers||{}).sort((a,b)=>String(a.name||a.worker_id).localeCompare(String(b.name||b.worker_id)));document.getElementById('wc').textContent=(s.online_workers||0)+' / '+ws.length;document.getElementById('workers').innerHTML=ws.map(w=>`<tr><td><b>${esc(w.name||w.worker_id)}</b><div class="small">${esc(w.worker_id)}</div></td><td>${w.online?'<span class="ok">online</span>':'<span class="bad">offline</span>'}<br>${esc(w.status||'')}</td><td>${esc(w.gpu_device||'')}<div class="small">${esc(w.backend||'')}</div></td><td><b>${fmt(w.verified_hashrate_hs||w.hashrate_hs||0)}</b><div class="small">Anzeige ${fmt(w.hashrate_hs||0)}</div></td><td><div>${Number(w.last_interval_hashes||0).toLocaleString()} Nonces</div><div class="small">in ${Number(w.last_interval_seconds||0).toFixed(3)}s · Batches ${Number(w.completed_batches||0).toLocaleString()}</div></td><td>${metric(w)}</td><td>${tuning(w)}</td><td>${w.age_seconds||0}s</td></tr>`).join('');let max=Math.max(1,...ws.map(w=>Number((w.verified_hashrate_hs||w.hashrate_hs)||0)));document.getElementById('bars').innerHTML=ws.map(w=>`<div style="margin:8px 0"><b>${esc(w.name||w.worker_id)}</b> <span class="small">${fmt(w.hashrate_hs||0)}</span><div class="bar"><span style="width:${Math.max(1,100*Number((w.verified_hashrate_hs||w.hashrate_hs)||0)/max)}%"></span></div></div>`).join('');document.getElementById('logs').innerHTML=(s.logs||[]).slice(-80).map(l=>`<div><span class="small">${esc(l.ts)}</span> ${esc(l.msg)}</div>`).join('');let lg=document.getElementById('logs');lg.scrollTop=lg.scrollHeight;document.getElementById('round').textContent=JSON.stringify(s.current_round||{},null,2);document.getElementById('err').textContent=JSON.stringify({last_error:s.last_error,last_submit_result:s.last_submit_result},null,2)}
+async function tick(){let s=await (await fetch('/api/status')).json();let sel=document.getElementById('profile'); if(sel){let cur=s.active_rpc_profile||''; let opts=Object.entries(s.rpc_profiles||{}).map(([k,v])=>`<option value="${esc(k)}" ${k===cur?'selected':''}>${esc(v.label||k)}</option>`).join(''); if(sel.innerHTML!==opts)sel.innerHTML=opts; let p=(s.rpc_profiles||{})[cur]||{}; document.getElementById('profileInfo').textContent=cur?`${cur} · ${p.rpc_wallet||'no wallet'} · ${p.mining_address||''}`:'';}document.getElementById('run').innerHTML=s.running?'<span class="ok">● RUNNING</span>':'<span class="bad">● STOPPED</span>';document.getElementById('hr').textContent=fmt(s.total_hashrate_hs);document.getElementById('height').textContent=s.height||'—';document.getElementById('rt').textContent=dur(s.runtime_seconds);document.getElementById('jc').textContent=s.active_jobs??s.cached_jobs??'—';let ws=Object.values(s.workers||{}).sort((a,b)=>String(a.name||a.worker_id).localeCompare(String(b.name||b.worker_id)));document.getElementById('wc').textContent=(s.online_workers||0)+' / '+ws.length;document.getElementById('workers').innerHTML=ws.map(w=>`<tr><td><b>${esc(w.name||w.worker_id)}</b><div class="small">${esc(w.worker_id)}</div></td><td>${w.online?'<span class="ok">online</span>':'<span class="bad">offline</span>'}<br>${esc(w.status||'')}</td><td>${esc(w.gpu_device||'')}<div class="small">${esc(w.backend||'')}</div></td><td><b>${fmt(w.verified_hashrate_hs||w.hashrate_hs||0)}</b><div class="small">Anzeige ${fmt(w.hashrate_hs||0)}</div></td><td><div>${Number(w.last_interval_hashes||0).toLocaleString()} Nonces</div><div class="small">in ${Number(w.last_interval_seconds||0).toFixed(3)}s · Batches ${Number(w.completed_batches||0).toLocaleString()}</div></td><td>${metric(w)}</td><td>${tuning(w)}</td><td>${w.age_seconds||0}s</td></tr>`).join('');let max=Math.max(1,...ws.map(w=>Number((w.verified_hashrate_hs||w.hashrate_hs)||0)));document.getElementById('bars').innerHTML=ws.map(w=>`<div style="margin:8px 0"><b>${esc(w.name||w.worker_id)}</b> <span class="small">${fmt(w.hashrate_hs||0)}</span><div class="bar"><span style="width:${Math.max(1,100*Number((w.verified_hashrate_hs||w.hashrate_hs)||0)/max)}%"></span></div></div>`).join('');document.getElementById('logs').innerHTML=(s.logs||[]).slice(-80).map(l=>`<div><span class="small">${esc(l.ts)}</span> ${esc(l.msg)}</div>`).join('');let lg=document.getElementById('logs');lg.scrollTop=lg.scrollHeight;document.getElementById('round').textContent=JSON.stringify(s.current_round||{},null,2);document.getElementById('err').textContent=JSON.stringify({last_error:s.last_error,last_submit_result:s.last_submit_result},null,2)}
 setInterval(tick,1000);tick();</script></body></html>
 '''
 
@@ -1172,7 +1299,7 @@ REGTEST_HTML = r'''<!doctype html><html lang="de"><head><meta charset="utf-8"><t
 &quot;rpc_user&quot;: &quot;bitcoinrpc&quot;,
 &quot;rpc_pass&quot;: &quot;change-me&quot;</pre></div><script>async function show(id,p){let el=document.getElementById(id);try{let r=await p;el.textContent=JSON.stringify(await r.json(),null,2)}catch(e){el.textContent=String(e)}}function rpcTest(){show('rpc', fetch('/api/rpc_test'))}function newAddress(){show('addr', fetch('/api/regtest/newaddress',{method:'POST'}))}function genBlock(){show('gen', fetch('/api/regtest/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({blocks:1})}))}</script></body></html>'''
 
-CONFIG_HTML = r'''<!doctype html><html lang="de"><head><meta charset="utf-8"><title>Config</title><style>body{font-family:system-ui;background:#0b1020;color:#e8eefc;margin:20px}textarea{width:100%;height:70vh;background:#111936;color:#e8eefc;border:1px solid #26345f;border-radius:12px;padding:12px}button,a{background:#2563eb;color:white;border:0;border-radius:10px;padding:10px 14px;text-decoration:none}</style></head><body><h1>Master config.json</h1><form method="post"><textarea name="config">{{config}}</textarea><br><br><button>Speichern</button> <a href="/">Zurück</a></form></body></html>'''
+CONFIG_HTML = r'''<!doctype html><html lang="de"><head><meta charset="utf-8"><title>Config</title><style>body{font-family:system-ui;background:#0b1020;color:#e8eefc;margin:20px}textarea{width:100%;height:70vh;background:#111936;color:#e8eefc;border:1px solid #26345f;border-radius:12px;padding:12px}button,a{background:#2563eb;color:white;border:0;border-radius:10px;padding:10px 14px;text-decoration:none}</style></head><body><h1>Master config.json</h1><p>RPC-Zugangsdaten liegen jetzt in <code>rpc_profiles</code>. Beim Wechsel des aktiven Profils stoppt der Master automatisch.</p><form method="post"><textarea name="config">{{config}}</textarea><br><br><button>Speichern</button> <a href="/">Zurück</a></form></body></html>'''
 
 if __name__ == "__main__":
     c = cfg()
