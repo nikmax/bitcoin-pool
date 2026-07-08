@@ -2,7 +2,7 @@ config.json
 pool/config.json
 data
 
-shared/__pychache__
+shared/__pycache__
 pool/__pycache__
 pool/bitcoin/__pycache__
 pool/rounds/__pycache__
